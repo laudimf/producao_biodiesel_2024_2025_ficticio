@@ -74,7 +74,63 @@ def caixa(d, col, cores):
     return alt.layer(rule, bar, med).properties(width="container", height=300)
 
 
+# --- modelo de risco do lote (regressão logística com termos quadráticos, só com numpy)
+NUM = ["massa_oleo_kg", "acidez_oleo", "umidade_oleo", "temp_reacao_C", "razao_molar",
+       "catalisador_pct", "tempo_min", "agitacao_rpm", "dias_desde_limpeza"]
+COLUNAS_MODELO = NUM + ["reator_R2", "reator_R3", "turno_Noite", "turno_Tarde",
+                        "fornecedor_B", "fornecedor_C", "temp_c2", "razao_c2", "catal_c2"]
+GRUPOS = {"massa_oleo_kg": "Massa de óleo", "acidez_oleo": "Acidez do óleo", "umidade_oleo": "Umidade do óleo",
+          "temp_reacao_C": "Temperatura", "temp_c2": "Temperatura", "razao_molar": "Razão molar",
+          "razao_c2": "Razão molar", "catalisador_pct": "Catalisador", "catal_c2": "Catalisador",
+          "tempo_min": "Tempo de reação", "agitacao_rpm": "Agitação", "dias_desde_limpeza": "Dias desde a limpeza",
+          "reator_R2": "Reator", "reator_R3": "Reator", "turno_Noite": "Turno", "turno_Tarde": "Turno",
+          "fornecedor_B": "Fornecedor do óleo", "fornecedor_C": "Fornecedor do óleo"}
+
+
+def caracteristicas(d):
+    X = d[NUM].astype(float).copy()
+    for col, val in [("reator", "R2"), ("reator", "R3"), ("turno", "Noite"), ("turno", "Tarde"),
+                     ("fornecedor", "B"), ("fornecedor", "C")]:
+        X[f"{col}_{val}"] = (d[col] == val).astype(float)
+    X["temp_c2"] = (d["temp_reacao_C"] - 62) ** 2
+    X["razao_c2"] = (d["razao_molar"] - 7.8) ** 2
+    X["catal_c2"] = (d["catalisador_pct"] - 1.0) ** 2
+    return X[COLUNAS_MODELO]
+
+
+def ajustar_logistica(X, y, l2=1.0, iteracoes=50):
+    """Regressão logística com penalidade L2, ajustada pelo método de Newton."""
+    mu, sd = X.mean(axis=0), X.std(axis=0)
+    sd[sd == 0] = 1.0
+    Z = np.column_stack([np.ones(len(X)), (X - mu) / sd])
+    pen = np.eye(Z.shape[1]) * l2
+    pen[0, 0] = 0.0
+    w = np.zeros(Z.shape[1])
+    for _ in range(iteracoes):
+        p = 1 / (1 + np.exp(-(Z @ w)))
+        grad = Z.T @ (p - y) + pen @ w
+        hess = Z.T @ (Z * (p * (1 - p))[:, None]) + pen
+        passo = np.linalg.solve(hess, grad)
+        w -= passo
+        if np.abs(passo).max() < 1e-8:
+            break
+    return {"mu": mu, "sd": sd, "w": w}
+
+
+@st.cache_resource
+def treinar_modelo(_dados):
+    d = _dados.dropna(subset=NUM)
+    return ajustar_logistica(caracteristicas(d).values, (d["fora_espec"] > 0).astype(float).values)
+
+
+def risco(modelo, d):
+    Z = (caracteristicas(d).values - modelo["mu"]) / modelo["sd"]
+    eta = modelo["w"][0] + Z @ modelo["w"][1:]
+    return 1 / (1 + np.exp(-eta)), Z
+
+
 df, qualidade = carregar()
+modelo = treinar_modelo(df)
 
 # --- filtros
 st.sidebar.header("Filtros")
@@ -115,8 +171,8 @@ if len(por_reator) > 1 and len(por_forn) > 1:
     st.info(f"Menor rendimento: reator {r_pior['reator']} ({pct(r_pior['rendimento'])}). "
             f"Mais lotes fora da especificação: fornecedor {f_pior['fornecedor']} ({pct(f_pior['fora'])}).")
 
-aba1, aba2, aba3, aba4, aba5 = st.tabs(["Visão geral", "Reatores e limpeza", "Matéria-prima",
-                                         "Temperatura e turno", "Dados"])
+aba1, aba2, aba3, aba4, aba5, aba6 = st.tabs(["Visão geral", "Reatores e limpeza", "Matéria-prima",
+                                                "Temperatura e turno", "Risco do lote", "Dados"])
 
 with aba1:
     st.subheader("Rendimento médio mensal por reator")
@@ -201,6 +257,75 @@ with aba4:
     st.caption("O turno da noite tem poucos lotes; interprete a diferença com cautela.")
 
 with aba5:
+    st.subheader("Risco de o lote sair fora da especificação")
+    st.caption("Informe as condições previstas para o lote e o modelo estima o risco antes do fim da batelada. "
+               "Esta aba não usa os filtros da barra lateral.")
+    c1, c2, c3 = st.columns(3)
+    reator_in = c1.selectbox("Reator", ["R1", "R2", "R3"])
+    turno_in = c1.selectbox("Turno", TURNOS)
+    forn_in = c1.selectbox("Fornecedor do óleo", ["A", "B", "C"])
+    dias_in = c1.slider("Dias desde a última limpeza", 0, 330, 60, 5)
+    acid_in = c2.slider("Acidez do óleo (mg KOH/g)", 0.1, 5.5, 0.4, 0.1)
+    umid_in = c2.slider("Umidade do óleo (%)", 0.01, 0.30, 0.05, 0.01)
+    massa_in = c2.slider("Massa de óleo (kg)", 850, 1150, 1000, 10)
+    temp_in = c3.slider("Temperatura de reação (°C)", 55.0, 70.0, 62.0, 0.5)
+    razao_in = c3.slider("Razão molar metanol:óleo", 4.0, 9.0, 6.0, 0.1)
+    cat_in = c3.slider("Catalisador (% da massa de óleo)", 0.5, 1.6, 1.0, 0.05)
+    tempo_in = c3.slider("Tempo de reação (min)", 40, 120, 75, 5)
+    rpm_in = c3.slider("Agitação (rpm)", 300, 560, 420, 10)
+
+    linha_in = pd.DataFrame([{
+        "massa_oleo_kg": massa_in, "acidez_oleo": acid_in, "umidade_oleo": umid_in, "temp_reacao_C": temp_in,
+        "razao_molar": razao_in, "catalisador_pct": cat_in, "tempo_min": tempo_in, "agitacao_rpm": rpm_in,
+        "dias_desde_limpeza": dias_in, "reator": reator_in, "turno": turno_in, "fornecedor": forn_in}])
+    prob, Z = risco(modelo, linha_in)
+    p = float(prob[0])
+    m1, m2 = st.columns([1, 2])
+    m1.metric("Risco de ficar fora da especificação", pct(p * 100))
+    if p < 0.10:
+        m2.success("Risco baixo: condições parecidas com as dos lotes que saem dentro da especificação.")
+    elif p < 0.30:
+        m2.warning("Risco moderado: veja abaixo os fatores que mais pesam neste lote.")
+    else:
+        m2.error("Risco alto: considere ajustar as condições ou o fornecedor antes de iniciar o lote.")
+    st.caption(f"Para comparação, {pct((df['fora_espec'] > 0).mean() * 100)} dos lotes da base saíram fora da especificação.")
+
+    g1, g2 = st.columns(2)
+    with g1:
+        st.subheader("O que pesa neste lote")
+        st.caption("Em relação a um lote médio. Barras laranja aumentam o risco; azuis reduzem.")
+        efeito = pd.Series(Z[0] * modelo["w"][1:], index=COLUNAS_MODELO).groupby(GRUPOS).sum()
+        efeito = efeito.sort_values(ascending=False).reset_index()
+        efeito.columns = ["fator", "efeito"]
+        st.altair_chart(alt.Chart(efeito).mark_bar().encode(
+            x=alt.X("efeito:Q", title="Efeito no risco (escala do modelo)"),
+            y=alt.Y("fator:N", sort=list(efeito["fator"]), title=None),
+            color=alt.condition(alt.datum.efeito > 0, alt.value("#e0902a"), alt.value("#7fc6cb")),
+            tooltip=["fator", alt.Tooltip("efeito:Q", format=".2f")]
+        ).properties(width="container", height=320))
+    with g2:
+        st.subheader("Risco conforme a temperatura")
+        st.caption("Demais condições mantidas como informadas.")
+        temps = np.arange(56.0, 68.01, 0.5)
+        grade = pd.concat([linha_in] * len(temps), ignore_index=True)
+        grade["temp_reacao_C"] = temps
+        curva = pd.DataFrame({"temperatura": temps, "risco": risco(modelo, grade)[0] * 100})
+        linha_c = alt.Chart(curva).mark_line(color="#0c7c86", strokeWidth=2.5).encode(
+            x=alt.X("temperatura:Q", title="Temperatura (°C)", scale=alt.Scale(zero=False)),
+            y=alt.Y("risco:Q", title="Risco (%)"),
+            tooltip=[alt.Tooltip("temperatura:Q", format=".1f"), alt.Tooltip("risco:Q", format=".1f")])
+        atual = alt.Chart(pd.DataFrame({"x": [temp_in]})).mark_rule(color="#e0902a", strokeDash=[5, 4]).encode(x="x:Q")
+        st.altair_chart(alt.layer(linha_c, atual).properties(width="container", height=320))
+
+    with st.expander("Sobre este modelo"):
+        st.write("Regressão logística com termos quadráticos para temperatura, razão molar e catalisador, que têm "
+                 "um ponto ótimo. Usa só variáveis conhecidas durante a operação, sem nenhum resultado do lote. "
+                 "No teste (treino com 2024 e teste com 2025), o AUC foi de 0,94, e ao sinalizar os 20% de lotes de "
+                 "maior risco o modelo pegou cerca de 82% dos lotes fora da especificação. A versão desta aba é "
+                 "treinada com todos os lotes. Os dados são fictícios; numa planta real, o modelo deve ser "
+                 "treinado e validado com os dados da própria empresa.")
+
+with aba6:
     st.subheader("Lotes filtrados")
     mostrar = d.drop(columns=["mes", "fora_espec"]).sort_values("data_hora_inicio")
     st.dataframe(mostrar, hide_index=True)
